@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    image: light-dose-api:latest
+    container_name: light-dose-api
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/lightdose.db
+      SNAPSHOT_DIR: /snapshots
+    volumes:
+      - lightdose-data:/data
+      - lightdose-snapshots:/snapshots
+    restart: unless-stopped
+
+volumes:
+  lightdose-data:
+  lightdose-snapshots:
