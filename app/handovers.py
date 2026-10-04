@@ -7,9 +7,18 @@
 - 展品必须同时列在两轮的**预期清单**中，并在各轮**明确定位到所报区域**：
   缺失（无事件）、错位（定位区域 ≠ 预期/所报区域）、位置不明（信号歧义）
   或未列入预期，均不得交接（409）；
+- **跨归并证据解释**：盘点轮次固化时按当时的别名关系把展品 ID 解析为
+  规范档案，固化结果**不改写**。归并后（含链式归并）规范档案可能拥有
+  多个身份（自身 + 全部别名），因此核验一轮证据时把**当前别名关系下
+  指向该规范档案的全部身份**（规范 ID + 别名）放到该轮固化结果中逐一
+  解释：任何一份证据缺失、错位、位置不明或意外出现，或不同身份定位到
+  不同区域、与所报区域不一致，均 **409 不得择一放行**；
 - **首次交接**以来源轮建链（链内序号从 1 起）；此后只能从上一笔交接的
   **接收轮与接收区域**续接——新一笔的来源轮/来源区域必须与上一笔的
-  接收轮/接收区域一致；更早的旧轮次不能回填、不能覆盖当前去向；
+  接收轮/接收区域一致；更早的旧轮次不能回填、不能覆盖当前去向。
+  单侧有链接管归并（来源链改挂到无链目标）后，上一笔接收轮的固化证据
+  仍以归并前的来源规范 ID 存储，续接时按上面的跨归并口径解释，而不是
+  把旧证据的固化 ID 与当前目标 ID 直接比较；
 - 证据核验（别名解析、两轮固化结果读取与逐轮定位核对）与写入在**同一个
   SQLite 写事务**（``BEGIN IMMEDIATE``）内完成：并发交接最多一笔生效，
   任何失败整体回滚，不留半笔记录；
@@ -28,7 +37,7 @@ import sqlite3
 from fastapi import HTTPException
 
 from .inventory import load_round
-from .merge import resolve_canonical
+from .merge import aliases_of, resolve_canonical
 from .schemas import (
     AreaHandoverChainOut,
     AreaHandoverOut,
@@ -62,33 +71,91 @@ def _load_rounds(
     return source, target
 
 
-def _located_area(round_out, canonical_id: str) -> str | None:
-    """展品在一轮固化结果中明确定位到的区域。
+def _evidence_for_identities(
+    round_out, identities: list[str]
+) -> dict[str, tuple[str, ...]]:
+    """收集一轮固化结果中每个身份（规范 ID 及其当前别名）的证据状态。
 
-    只有列入预期且唯一明确定位在**预期区域**（即未出现在 missing /
-    misplaced / unknown_position 任一组）才返回该区域；意外出现
-    （不在预期清单）同样返回 None。返回 None 即不得交接。
+    盘点轮次固化时按**当时**的别名关系解析 ID，固化结果随后不改写（见
+    inventory.py）；归并后同一规范档案可能同时以多个身份出现在旧轮次中。
+    状态取自该轮固化的差异分组，互斥分类：
+
+    - ``located``   ：列入预期且未落入任一组（明确定位在预期区域）；
+    - ``missing``   ：列入预期但全程无有效事件；
+    - ``misplaced`` ：定位区域与预期区域不同（附带 expected/actual）；
+    - ``unknown_position``：最后窗口多区域信号差不足阈值；
+    - ``unexpected``：不在预期清单但被读到（意外出现）。
+
+    未在该轮出现（既无预期也无观测）的身份不在返回值中。
     """
-    bad = {m.canonical_id for m in round_out.missing}
-    bad |= {m.canonical_id for m in round_out.misplaced}
-    bad |= {u.canonical_id for u in round_out.unknown_position}
-    bad |= {u.canonical_id for u in round_out.unexpected}
-    for e in round_out.expectations:
-        if e.canonical_id == canonical_id and canonical_id not in bad:
-            return e.expected_area
-    return None
+    missing = {m.canonical_id: m for m in round_out.missing}
+    misplaced = {m.canonical_id: m for m in round_out.misplaced}
+    unknown = {u.canonical_id: u for u in round_out.unknown_position}
+    unexpected = {u.canonical_id: u for u in round_out.unexpected}
+    expected = {e.canonical_id: e for e in round_out.expectations}
+
+    findings: dict[str, tuple[str, ...]] = {}
+    for ident in identities:
+        if ident in missing:
+            findings[ident] = ("missing", missing[ident].expected_area)
+        elif ident in misplaced:
+            m = misplaced[ident]
+            findings[ident] = ("misplaced", m.expected_area, m.actual_area)
+        elif ident in unknown:
+            findings[ident] = ("unknown_position", unknown[ident].expected_area)
+        elif ident in unexpected:
+            findings[ident] = ("unexpected", unexpected[ident].actual_area)
+        elif ident in expected:
+            findings[ident] = ("located", expected[ident].expected_area)
+    return findings
 
 
-def _require_located(round_out, canonical_id: str, reported_area: str,
-                     role: str, round_id: str) -> None:
-    """核验展品在该轮预期清单中且明确定位到所报区域，否则 409 拒绝交接。"""
-    actual = _located_area(round_out, canonical_id)
-    if actual is None:
+def _require_identities_located(
+    conn: sqlite3.Connection,
+    round_out,
+    canonical_id: str,
+    reported_area: str,
+    role: str,
+    round_id: str,
+) -> None:
+    """在当前别名关系下解释一轮固化证据并核验明确定位。
+
+    把当前指向该规范档案的**全部身份**（规范 ID + 全部别名）作为一个整体
+    核对：任一身份缺失、错位、位置不明或意外出现，或不同身份定位区域冲突、
+    与所报区域不一致，均 409 拒绝交接——**任何一份证据不合格都不择一放行**。
+    仅在归并发生后轮次固化在先时才会出现多个身份；普通（未归并）情形
+    身份集合只有规范 ID 一个，核验口径与历史行为完全一致。
+    """
+    identities = sorted({canonical_id, *aliases_of(conn, canonical_id)})
+    findings = _evidence_for_identities(round_out, identities)
+
+    if not findings:
         raise HTTPException(
             status_code=409,
-            detail=f"展品 {canonical_id} 在{role}轮 {round_id} 中缺失、错位、位置不明"
-                   "或未列入预期清单，不得交接",
+            detail=f"展品 {canonical_id}（按当前别名关系核对身份 {identities}）"
+                   f"在{role}轮 {round_id} 中缺失、错位、位置不明或未列入预期清单，"
+                   "不得交接",
         )
+
+    bad = {ident: f for ident, f in findings.items() if f[0] != "located"}
+    if bad:
+        raise HTTPException(
+            status_code=409,
+            detail=f"展品 {canonical_id} 在{role}轮 {round_id} 固化证据中的身份 "
+                   f"{sorted(bad)} 存在缺失、错位、位置不明或意外出现，"
+                   "跨归并证据须全部合格，不得择一放行",
+        )
+
+    located_areas = {f[1] for f in findings.values()}
+    if len(located_areas) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"展品 {canonical_id} 在{role}轮 {round_id} 固化证据中的多个身份 "
+                   f"{sorted(findings)} 分别明确定位到不同区域 {sorted(located_areas)}，"
+                   "定位区域冲突，不得交接",
+        )
+
+    actual = located_areas.pop()
     if actual != reported_area:
         raise HTTPException(
             status_code=409,
@@ -142,9 +209,16 @@ def create_handover(
                        "跨轮交接要求两轮起始时间严格递增",
             )
 
-        # 展品须列入两轮预期清单且在各轮明确定位于所报区域
-        _require_located(source, canonical, payload.source_area, "来源", source.round_id)
-        _require_located(target, canonical, payload.target_area, "接收", target.round_id)
+        # 展品须列入两轮预期清单且在各轮明确定位于所报区域。归并后旧轮次的
+        # 固化证据可能以上述规范档案的旧身份（来源 ID）存储，这里在同一写事务内
+        # 按当前别名关系把规范 ID 与全部别名作为一个整体解释，任一身份证据不合格
+        # 或定位区域冲突都拒绝，不择一放行。
+        _require_identities_located(
+            conn, source, canonical, payload.source_area, "来源", source.round_id
+        )
+        _require_identities_located(
+            conn, target, canonical, payload.target_area, "接收", target.round_id
+        )
 
         # 续接校验：首次交接以来源轮建链；此后只能从上一笔的接收轮/区域续接
         last = conn.execute(

@@ -529,7 +529,10 @@ curl -s 'http://localhost:8000/exhibits/<id>/dose?start=2026-09-20T00:00:00Z&end
   列出保留的链标识，可分别用 `GET /receipts/chains/{chain_id}/verify` 核查；
 - 跨轮区域交接链：单侧已有交接链时归并把整链**改挂**到目标（证据行不变，
   归并后用目标 ID 或来源别名查到同一条链，响应 `handover_chain_carried=true`）；
-  **两侧都有交接链时 409 拒绝归并、不改动任何记录**——预演以
+  归并后下一笔交接**沿用归并前固化的接收轮**作为来源轮，服务在写事务内按当前
+  别名关系解释目标 ID 与全部来源别名在两轮中的固化证据（同轮多个身份须全部
+  定位且区域一致，任一不合格或冲突都 409、不择一放行），原盘点摘要与旧交接
+  记录不改写；**两侧都有交接链时 409 拒绝归并、不改动任何记录**——预演以
   `area_handover_conflict=true`、`source_handover_count` /
   `target_handover_count` 明示，交接链指纹也纳入版本令牌，预演后新增交接
   同样使令牌失效（详见下文“跨盘点轮次的馆藏区域交接”）。
@@ -1399,6 +1402,14 @@ curl -s http://localhost:8000/inventory-rounds/ROUND-2026-09-21-01
   缺失（无有效事件）、错位（定位区域不同）、位置不明（最后窗口多区域信号差
   不足阈值）或不在预期清单（意外出现）均 **409 不得交接**；所报区域与该轮
   实际定位区域不一致同样 409；
+- **跨归并证据解释**：盘点结果固化时按当时的别名关系解析展品 ID，固化后
+  **不改写**。档案归并后同一规范档案可能拥有多个身份（自身 + 来源别名），
+  提交时服务在同一写事务内把**当前别名关系下指向该规范档案的全部身份**放到
+  两轮固化证据中一起解释——归并前固化、旧身份名下的接收轮，自动作为下一笔
+  来源轮续接（用目标 ID 或来源别名提交等价）；若同轮固化前列有多个身份，
+  须一起核对预期及缺失、错位、位置不明、意外出现信息：**任何一份证据不合格
+  或不同身份定位区域冲突都 409，绝不择一放行**（不能只挑与所报区域一致的
+  那份身份）；
 - **首次交接以来源轮建链**；此后每一笔的来源轮/来源区域必须与上一笔的
   接收轮/接收区域**完全一致**才能续接。旧轮次不能回填、不能分叉、
   不能覆盖当前去向（违反 → 409）；
@@ -1504,10 +1515,69 @@ curl -s http://localhost:8000/exhibits/vase-001/area-handovers
 - **单侧已有交接链**时归并：来源链在归并事务内**整链改挂**到目标规范档案
   （序号与全部证据行不变），归并提交结果 `"handover_chain_carried": true`；
   归并后用**目标 ID 或来源别名**查询到的是同一条链、当前去向保持不变；
+- **归并后续接沿用归并前固化的接收轮**：链尖那笔的来源/接收轮是在归并前固化
+  的，盘点结果中登记的是**当时的来源规范 ID**。归并后下一笔交接的来源轮就是
+  这一旧轮——服务在写事务内按**当前别名关系**（目标 ID + 全部来源别名）
+  解释两轮固化证据，因此用目标 ID 或来源别名提交都能续接，不会把旧轮次里的
+  固化 ID 与当前目标 ID 直接比较而误判 409；
+- **同轮多个身份一起核对**：若某轮（在归并前固化时）同时列有归并双方——
+  归并后它们成为同一规范档案的多个身份——则该轮证据必须**全部合格**：每份
+  身份都明确定位、且定位区域一致并与所报区域相同；任一份缺失 / 错位 /
+  位置不明 / 意外出现，或多份身份定位区域冲突，均 **409 不落库，不择一放行**；
 - **两侧都有交接链**时拒绝归并：预演结果 `"area_handover_conflict": true`、
   `"ready_to_commit": false`，提交 **409 且不改动任何记录**
   （同时返回两侧笔数 `source_handover_count` / `target_handover_count`）；
 - 预演后任一侧新增交接会使预演令牌过期，提交 409。
+- 跨归并续接**只 INSERT 新交接行**：原盘点摘要（含旧身份名下的固化结果）与
+  旧交接记录（轮次、区域、轮次摘要、固化时刻）一律不改写，归并改挂与查询
+  行为保持不变。
+
+```bash
+# 场景：DUP-042 归并前已有一笔交接 r1(A)→r2(B)，随后归并进 EX-042（无链）
+# 1) 归并前：来源档案先有交接链
+curl -s -X POST http://localhost:8000/exhibits/DUP-042/area-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"exhibit_id":"DUP-042","source_round_id":"r1","target_round_id":"r2",
+       "source_area":"A-常设展厅","target_area":"B-周转厅"}'
+# {"seq": 1, "canonical_id": "DUP-042", ...}
+
+# 2) 单侧有链归并：整链改挂到目标
+curl -s -X POST http://localhost:8000/merges/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<preview-token>","resolutions":[]}'
+# {"handover_chain_carried": true, "target_id": "EX-042", "aliases": ["DUP-042"], ...}
+
+# 3) 归并后新一轮盘点（用目标 ID）固化：EX-042 在 r3 明确定位于 C 区
+# 4) 沿用归并前固化的接收轮 r2/B 作为来源轮续接——
+#    用目标 ID 提交（来源别名 DUP-042 等价）：
+curl -s -X POST http://localhost:8000/exhibits/EX-042/area-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"exhibit_id":"EX-042","source_round_id":"r2","target_round_id":"r3",
+       "source_area":"B-周转厅","target_area":"C-库房"}'
+# {"seq": 2, "requested_id": "EX-042", "canonical_id": "EX-042",
+#  "source_round_id": "r2", "target_round_id": "r3",
+#  "source_round_digest": "<归并前 r2 固化摘要，原样引用>", ...}
+
+# 等价：用来源别名提交与查询
+curl -s -X POST http://localhost:8000/exhibits/DUP-042/area-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"exhibit_id":"DUP-042","source_round_id":"r2","target_round_id":"r3",
+       "source_area":"B-周转厅","target_area":"C-库房"}'
+# {"seq": 2, "requested_id": "DUP-042", "canonical_id": "EX-042", ...}
+```
+
+同轮多个身份的证据冲突时（例：r2 在归并前把 DUP-042 定位 B、EX-042
+定位 A），无论报 B 还是报 A 都 **409**，不会只挑选一致的那份放行：
+
+```bash
+curl -i -X POST http://localhost:8000/exhibits/EX-042/area-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"exhibit_id":"EX-042","source_round_id":"r2","target_round_id":"r3",
+       "source_area":"B-周转厅","target_area":"C-库房"}'
+# HTTP/1.1 409 Conflict
+# {"detail": "展品 EX-042 在来源轮 r2 固化证据中的多个身份 ['DUP-042', 'EX-042']
+#  分别明确定位到不同区域 ['A-常设展厅', 'B-周转厅']，定位区域冲突，不得交接"}
+```
 
 ```bash
 # 单侧有链：归并后别名与目标 ID 查询等价
