@@ -353,6 +353,209 @@ def test_handover_accepts_merge_alias(env):
     assert chain(client, "tgt")["history"] == got["history"]
 
 
+# ---------- 跨归并续接：旧轮固化证据按当前别名关系解释 ----------
+
+def _merge(client: TestClient, src: str, tgt: str) -> dict:
+    token = client.post("/merges/preview",
+                        json={"source_id": src, "target_id": tgt}).json()["token"]
+    r = client.post("/merges/commit", json={"token": token, "resolutions": []})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_continuation_after_merge_interprets_old_source_round_via_alias(env):
+    """来源档案已有交接链并归并到无链目标：沿用归并前固化的接收轮作为
+    下一笔来源轮，用目标 ID 或来源别名提交都应续接成功。"""
+    client = env
+    make_exhibit(client, "src")
+    make_exhibit(client, "tgt")
+    reconcile(client, "r1", round_body(BASE, [("src", "A")]))
+    reconcile(client, "r2", round_body(BASE + 100, [("src", "B")]))
+    handover(client, "src", ho("src", "r1", "A", "r2", "B"))
+
+    committed = _merge(client, "src", "tgt")
+    assert committed["handover_chain_carried"] is True
+
+    # 归并后的新轮以目标 ID 固化
+    reconcile(client, "r3", round_body(BASE + 200, [("tgt", "C")]))
+
+    # 用目标 ID 提交：来源轮 r2 的固化证据里只有旧身份 src（别名）
+    out = handover(client, "tgt", ho("tgt", "r2", "B", "r3", "C"))
+    assert out["seq"] == 2
+    assert out["canonical_id"] == "tgt" and out["requested_id"] == "tgt"
+    # 证据沿用归并前固化的轮次摘要，不改写盘点结果与旧交接记录
+    r2 = client.get("/inventory-rounds/r2").json()
+    assert out["source_round_digest"] == r2["request_digest"]
+    assert {e["canonical_id"] for e in r2["expectations"]} == {"src"}
+
+    got = chain(client, "tgt")
+    assert got["current_round_id"] == "r3" and got["current_area"] == "C"
+    assert [(h["seq"], h["source_round_id"], h["target_round_id"])
+            for h in got["history"]] == [(1, "r1", "r2"), (2, "r2", "r3")]
+
+    # 再续接一笔，用来源别名提交，来源轮 r3 的固化身份是 tgt（规范 ID）
+    reconcile(client, "r4", round_body(BASE + 300, [("tgt", "D")]))
+    out = handover(client, "src", ho("src", "r3", "C", "r4", "D"))
+    assert out["seq"] == 3
+    assert out["canonical_id"] == "tgt" and out["requested_id"] == "src"
+    assert chain(client, "src")["current_area"] == "D"
+
+
+def test_chain_tip_round_and_area_must_match_across_merge(env):
+    """跨归并续接仍须与链尖（上一笔接收轮/区域）完全一致。"""
+    client = env
+    make_exhibit(client, "src")
+    make_exhibit(client, "tgt")
+    reconcile(client, "r1", round_body(BASE, [("src", "A")]))
+    reconcile(client, "r2", round_body(BASE + 100, [("src", "B")]))
+    handover(client, "src", ho("src", "r1", "A", "r2", "B"))
+    _merge(client, "src", "tgt")
+    reconcile(client, "r3", round_body(BASE + 200, [("tgt", "C")]))
+
+    # 从链尖之外的旧轮回填 → 409
+    handover(client, "tgt", ho("tgt", "r1", "A", "r3", "C"),
+             expected_status=409)
+    # 来源轮是链尖但来源区域与固化去向不符 → 409
+    handover(client, "tgt", ho("tgt", "r2", "X", "r3", "C"),
+             expected_status=409)
+    # 接收轮定位与所报区域不符 → 409（证据按目标 ID 解释）
+    handover(client, "tgt", ho("tgt", "r2", "B", "r3", "B"),
+             expected_status=409)
+    # 失败不落库：链仍停在归并前的 r2/B
+    got = chain(client, "tgt")
+    assert len(got["history"]) == 1
+    assert got["current_round_id"] == "r2" and got["current_area"] == "B"
+    # 旧交接记录与盘点摘要未被改写
+    old = got["history"][0]
+    assert old["source_round_digest"] == \
+        client.get("/inventory-rounds/r1").json()["request_digest"]
+
+
+def _setup_two_identity_round(client: TestClient, round_id: str, start: float,
+                              expected: list[tuple[str, str]],
+                              events: list[tuple[str, str, float]],
+                              delta: float = 5) -> None:
+    reconcile(client, round_id, round_body(start, expected, events=events,
+                                           delta=delta))
+
+
+def test_premerge_round_two_identities_consistent_locations(env):
+    """归并前轮次列出两个身份且都明确定位于同一区域：证据一致，续接成功。"""
+    client = env
+    # 在归并前完成：建链（src 的 r1->r2）+ 一轮双方都明确定位于 C 的 r3
+    make_exhibit(client, "src")
+    make_exhibit(client, "tgt")
+    reconcile(client, "r1", round_body(BASE, [("src", "A")]))
+    reconcile(client, "r2", round_body(BASE + 100, [("src", "B")]))
+    handover(client, "src", ho("src", "r1", "A", "r2", "B"))
+    # r3 固化在归并之前：两个身份各自预期且都定位在 C
+    reconcile(client, "r3", round_body(BASE + 200, [("src", "C"), ("tgt", "C")]))
+    _merge(client, "src", "tgt")
+
+    # r3 在归并前固化（两份身份证据都合格且区域一致）→ 允许续接
+    out = handover(client, "tgt", ho("tgt", "r2", "B", "r3", "C"))
+    assert out["seq"] == 2
+    assert chain(client, "src")["current_area"] == "C"
+
+
+def test_premerge_round_two_identities_any_bad_evidence_blocks(env):
+    """同轮两个身份中任一份证据不合格（缺失/错位/位置不明/意外出现），
+    即使另一份明确定位也不得择一放行。"""
+    client = env
+    make_exhibit(client, "src")
+    make_exhibit(client, "tgt")
+
+    # 缺失：r-missing 中 src 明确定位 C，tgt 在预期清单但无事件
+    _setup_two_identity_round(
+        client, "r-missing", BASE + 200,
+        expected=[("src", "C"), ("tgt", "C")],
+        events=[("src", "C", BASE + 205)],
+    )
+    # 错位：r-mis 中 src 定位 C，tgt 定位 X
+    _setup_two_identity_round(
+        client, "r-mis", BASE + 300,
+        expected=[("src", "C"), ("tgt", "C")],
+        events=[("src", "C", BASE + 305), ("tgt", "X", BASE + 305)],
+    )
+    # 位置不明：r-unk 中 src 定位 C，tgt 最后窗口多区域信号差不足阈值
+    _setup_two_identity_round(
+        client, "r-unk", BASE + 400,
+        expected=[("src", "C"), ("tgt", "C")],
+        events=[("src", "C", BASE + 405),
+                ("tgt", "C", BASE + 405), ("tgt", "X", BASE + 405)],
+        delta=5,
+    )
+    # 意外出现：r-unexp 只预期 src 在 C，tgt 不在预期但被读到 C
+    _setup_two_identity_round(
+        client, "r-unexp", BASE + 500,
+        expected=[("src", "C")],
+        events=[("src", "C", BASE + 505), ("tgt", "C", BASE + 505)],
+    )
+
+    reconcile(client, "r1", round_body(BASE - 200, [("src", "A")]))
+    reconcile(client, "r2", round_body(BASE - 100, [("src", "B")]))
+    handover(client, "src", ho("src", "r1", "A", "r2", "B"))
+    _merge(client, "src", "tgt")
+
+    for rid in ("r-missing", "r-mis", "r-unk", "r-unexp"):
+        handover(client, "tgt", ho("tgt", "r2", "B", rid, "C"),
+                 expected_status=409)
+        handover(client, "src", ho("src", "r2", "B", rid, "C"),
+                 expected_status=409)
+
+    # 全部失败、不落库：链尖仍是归并前的 r2/B
+    got = chain(client, "tgt")
+    assert len(got["history"]) == 1
+    assert got["current_round_id"] == "r2" and got["current_area"] == "B"
+
+
+def test_premerge_round_conflicting_locations_block(env):
+    """同轮两个身份都明确定位但区域不一致（src 在 C、tgt 在 D）：
+    定位区域冲突，不能择一放行，409 且不写入。"""
+    client = env
+    make_exhibit(client, "src")
+    make_exhibit(client, "tgt")
+    reconcile(client, "r1", round_body(BASE, [("src", "A")]))
+    reconcile(client, "r2", round_body(BASE + 100, [("src", "B")]))
+    handover(client, "src", ho("src", "r1", "A", "r2", "B"))
+    # 双方各自预期各自的区域且都明确定位：归并后解释为同一展品位置冲突
+    reconcile(client, "r3", round_body(
+        BASE + 200, [("src", "C"), ("tgt", "D")]))
+    _merge(client, "src", "tgt")
+
+    handover(client, "tgt", ho("tgt", "r2", "B", "r3", "C"),
+             expected_status=409)
+    handover(client, "tgt", ho("tgt", "r2", "B", "r3", "D"),
+             expected_status=409)
+    assert chain(client, "tgt")["current_round_id"] == "r2"
+    assert len(chain(client, "tgt")["history"]) == 1
+
+
+def test_failed_continuation_leaves_old_records_untouched(env):
+    """跨归并续接失败时，原盘点摘要与旧交接记录均不改写。"""
+    client = env
+    make_exhibit(client, "src")
+    make_exhibit(client, "tgt")
+    r1 = reconcile(client, "r1", round_body(BASE, [("src", "A")]))
+    r2 = reconcile(client, "r2", round_body(BASE + 100, [("src", "B")]))
+    h1 = handover(client, "src", ho("src", "r1", "A", "r2", "B"))
+    _merge(client, "src", "tgt")
+    # r3 中 src 已不存在（只有 tgt），但 tgt 缺失 → 409
+    reconcile(client, "r3", round_body(BASE + 200, [("tgt", "C")], events=[]))
+
+    handover(client, "tgt", ho("tgt", "r2", "B", "r3", "C"),
+             expected_status=409)
+
+    assert client.get("/inventory-rounds/r1").json()["request_digest"] == \
+        r1["request_digest"]
+    assert client.get("/inventory-rounds/r2").json()["request_digest"] == \
+        r2["request_digest"]
+    got = chain(client, "tgt")
+    assert len(got["history"]) == 1
+    assert got["history"][0]["created_at"] == h1["created_at"]
+    assert got["history"][0]["source_round_digest"] == r1["request_digest"]
+
+
 # ---------- 归并联动：单侧链改挂、双侧链拒绝 ----------
 
 def test_merge_carries_single_side_chain_and_queryable_by_target_or_alias(env):

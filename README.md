@@ -532,7 +532,9 @@ curl -s 'http://localhost:8000/exhibits/<id>/dose?start=2026-09-20T00:00:00Z&end
   **两侧都有交接链时 409 拒绝归并、不改动任何记录**——预演以
   `area_handover_conflict=true`、`source_handover_count` /
   `target_handover_count` 明示，交接链指纹也纳入版本令牌，预演后新增交接
-  同样使令牌失效（详见下文“跨盘点轮次的馆藏区域交接”）。
+  同样使令牌失效。归并后续接新一笔交接时，**归并前固化轮次中的旧规范 ID
+  按当前别名关系解释**（同轮多个身份的证据一起核对，不合格即拒绝），
+  详见下文“跨盘点轮次的馆藏区域交接”。
 
 ### 7. 预演冲突
 
@@ -1399,9 +1401,17 @@ curl -s http://localhost:8000/inventory-rounds/ROUND-2026-09-21-01
   缺失（无有效事件）、错位（定位区域不同）、位置不明（最后窗口多区域信号差
   不足阈值）或不在预期清单（意外出现）均 **409 不得交接**；所报区域与该轮
   实际定位区域不一致同样 409；
+- **归并别名关系按当前事务内状态解释两轮固化证据**：盘点结果固化后绝不
+  改写，归并前的轮次证据中保留的是归并前的旧规范 ID。核验时取目标规范
+  档案及其**当前全部别名**作为同一展品的身份集合逐份核对——用目标 ID 或
+  来源别名提交等价。同轮下列有多个身份（归并前来源、目标各自建档）时，
+  **每份证据都必须合格**（列入预期、明确定位），且各身份定位区域必须
+  一致并与所报区域一致；任何一份证据缺失 / 错位 / 位置不明 / 意外出现，
+  或身份间定位区域冲突，都 **409 且不得择一放行**；
 - **首次交接以来源轮建链**；此后每一笔的来源轮/来源区域必须与上一笔的
-  接收轮/接收区域**完全一致**才能续接。旧轮次不能回填、不能分叉、
-  不能覆盖当前去向（违反 → 409）；
+  接收轮/接收区域**完全一致**才能续接。来源档案已有交接链并归并到无链
+  目标后，沿用归并前已固化的接收轮作为下一笔来源轮即可续接。旧轮次不能
+  回填、不能分叉、不能覆盖当前去向（违反 → 409）；
 - 证据核验与写入在同一个 `BEGIN IMMEDIATE` 事务内完成：**并发交接最多一笔
   生效**（竞争方 409），任何失败整体回滚，**不留半笔记录**；
 - 每笔交接固化两轮的请求摘要（`source_round_digest` /
@@ -1470,6 +1480,69 @@ curl -s -X POST http://localhost:8000/exhibits/vase-001/area-handovers \
 # {"detail": "交接链只能从上一笔的接收轮 ROUND-2026-10-01 续接，本次来源轮 … 不是当前去向所在轮；旧轮次不能回填覆盖当前去向"}
 ```
 
+### 29b. 归并后续接：旧轮固化证据按当前别名关系解释
+
+来源档案已有交接链，随后整链归并改挂到**无交接链**的目标档案时，盘点
+轮次固化结果**不回填、不改写**——归并前固化的轮次里，证据的规范 ID 仍是
+归并前的旧来源 ID。续接下一笔交接时，服务在**同一写事务**内取目标规范
+档案与其当前全部别名解释两轮证据，因此直接用**目标 ID 或来源别名**提交
+即可，不需要也不允许改写旧盘点摘要。
+
+```bash
+# 归并前：src 已有一笔交接 r1(A) -> r2(B)，两轮盘点均以 src 固化
+# POST /exhibits/src/area-handovers  {"source_round_id":"r1", ...}
+
+# src 归并进 tgt（目标无交接链，整链改挂；见“与档案归并的联动”）
+curl -s -X POST http://localhost:8000/merges/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id":"src","target_id":"tgt"}'
+curl -s -X POST http://localhost:8000/merges/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<preview-token>","resolutions":[]}'
+
+# 归并后的新轮 r3 以目标 ID tgt 固化，明确定位于 C
+# 续接时来源轮是归并前固化的 r2（证据中只有旧身份 src），用目标 ID 提交：
+curl -s -X POST http://localhost:8000/exhibits/tgt/area-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "exhibit_id": "tgt",
+        "source_round_id": "r2",
+        "target_round_id": "r3",
+        "source_area": "B-巡回展厅",
+        "target_area": "C-库房"
+      }'
+# {"seq": 2, "requested_id": "tgt", "canonical_id": "tgt", ...}
+
+# 等价写法：路径与请求体都用来源别名 src（解析到同一规范档案 tgt）
+curl -s -X POST http://localhost:8000/exhibits/src/area-handovers \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "exhibit_id": "src",
+        "source_round_id": "r2",
+        "target_round_id": "r3",
+        "source_area": "B-巡回展厅",
+        "target_area": "C-库房"
+      }'
+```
+
+若某轮在归并前把**两个身份都列入**（例如同一轮分别预期 `src`、`tgt`），
+两份证据会被一起核对：必须都列入预期、都明确定位，且定位区域一致——
+
+```bash
+# src 明确定位 C、tgt 缺失（或错位/位置不明/意外出现）→ 409，不能凭 src 一份放行
+# {"detail": "展品 tgt 在接收轮 r3 中存在不合格的盘点证据：身份 tgt 缺失（…）；
+#  同轮多个身份的证据须全部合格，不得择一放行，不得交接"}
+
+# 两份都明确定位但区域冲突（src 在 C、tgt 在 D）→ 409
+# {"detail": "展品 tgt 在接收轮 r3 中各归并前身份的定位区域冲突（['C-库房', 'D-展厅']），
+#  不能唯一确认位置，不得交接"}
+```
+
+任何证据失败均**整体 409、不落库**：链尖仍停在归并前的 `r2` /
+`B-巡回展厅`，原盘点 `request_digest` 与旧交接记录保持原样。续接成功后
+`GET /exhibits/{id}/area-handovers` 用目标 ID 或来源别名查到的仍是同一条
+链（`r1→r2→r3`），新笔的 `source_round_digest` 沿用归并前固化的轮次摘要。
+
 ### 30. 查询当前区域与交接历史
 
 ```bash
@@ -1504,6 +1577,8 @@ curl -s http://localhost:8000/exhibits/vase-001/area-handovers
 - **单侧已有交接链**时归并：来源链在归并事务内**整链改挂**到目标规范档案
   （序号与全部证据行不变），归并提交结果 `"handover_chain_carried": true`；
   归并后用**目标 ID 或来源别名**查询到的是同一条链、当前去向保持不变；
+  续接下一笔时来源轮可直接沿用归并前已固化的接收轮（旧身份证据按当前
+  别名关系解释，详见上文 29b）；
 - **两侧都有交接链**时拒绝归并：预演结果 `"area_handover_conflict": true`、
   `"ready_to_commit": false`，提交 **409 且不改动任何记录**
   （同时返回两侧笔数 `source_handover_count` / `target_handover_count`）；
